@@ -288,6 +288,8 @@ object PairAlert {
     fun pause(context: Context) {
         NotificationManagerCompat.from(context).cancel(ID)
         WorkManager.getInstance(context).cancelUniqueWork("pair-alert")
+        val pending = PendingIntent.getBroadcast(context, 5, Intent(context, PairReceiver::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        context.getSystemService(android.app.AlarmManager::class.java).cancel(pending)
     }
 
     @SuppressLint("MissingPermission")
@@ -295,41 +297,81 @@ object PairAlert {
         val manager = NotificationManagerCompat.from(context)
         val lessons = runCatching { JSONArray(prefs(context).getString("lessons", "[]")) }.getOrDefault(JSONArray())
         val now = System.currentTimeMillis() / 1000
-        var live: JSONObject? = null
+        val sorted = (0 until lessons.length()).map { lessons.getJSONObject(it) }.sortedBy { it.getLong("start") }
+        val live = sorted.firstOrNull { now in it.getLong("start") until it.getLong("end") }
+        val upcoming = sorted.firstOrNull { it.getLong("start") > now }
         var next = Long.MAX_VALUE
-        for (i in 0 until lessons.length()) {
-            val l = lessons.getJSONObject(i)
-            val start = l.getLong("start")
-            val end = l.getLong("end")
-            if (now in start until end) live = l
-            if (start > now) next = minOf(next, start)
-            if (end > now) next = minOf(next, end)
+        for (l in sorted) {
+            if (l.getLong("start") > now) next = minOf(next, l.getLong("start"))
+            if (l.getLong("end") > now) next = minOf(next, l.getLong("end"))
         }
-        if (live != null && AppSettings.wants(context, "pair") && AppSettings.canShow(context)) {
+        // Between two lessons (or before the first one) the same notification counts down to the next start.
+        val soon = if (live == null && upcoming != null && upcoming.getLong("start") - now <= SOON_SECONDS) upcoming else null
+        val shown = live ?: soon
+        if (shown != null && AppSettings.wants(context, "pair") && AppSettings.canShow(context)) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val channel = NotificationChannel(CHANNEL, "Идёт пара", NotificationManager.IMPORTANCE_LOW)
-                channel.description = "Сколько осталось до конца текущей пары"
+                channel.description = "Время до конца пары и до начала следующей"
+                channel.setShowBadge(false)
                 context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
             }
-            val end = live.getLong("end")
+            val start = shown.getLong("start")
+            val end = shown.getLong("end")
             val open = PendingIntent.getActivity(context, 1, Intent(context, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-            val place = live.optString("place")
+            val place = shown.optString("place")
+            val clock = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
+            fun at(ts: Long) = java.time.Instant.ofEpochSecond(ts).atZone(UniversityZone).format(clock)
+            val range = "${at(start)}–${at(end)}" + if (place.isNotEmpty()) " · $place" else ""
             val builder = NotificationCompat.Builder(context, CHANNEL)
                 .setSmallIcon(R.drawable.ic_stat_grade)
-                .setContentTitle(live.optString("subject"))
-                .setContentText(if (place.isNotEmpty()) "До конца пары · $place" else "До конца пары")
-                .setOngoing(true).setOnlyAlertOnce(true).setShowWhen(true)
-                .setWhen(end * 1000).setUsesChronometer(true).setChronometerCountDown(true)
-                .setTimeoutAfter((end - now) * 1000)
+                .setContentTitle(shown.optString("subject"))
+                .setOngoing(true).setOnlyAlertOnce(true).setSilent(true).setShowWhen(true)
+                .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setUsesChronometer(true).setChronometerCountDown(true)
                 .setContentIntent(open)
+            if (live != null) {
+                val after = sorted.firstOrNull { it.getLong("start") >= end }
+                val text = "Идёт пара · до ${at(end)}"
+                builder.setSubText("Идёт пара").setContentText(range)
+                    .setWhen(end * 1000).setTimeoutAfter((end - now) * 1000)
+                    .setProgress((end - start).toInt(), (now - start).toInt(), false)
+                    .setStyle(
+                        NotificationCompat.BigTextStyle().setBigContentTitle(shown.optString("subject")).bigText(
+                            "$text\n$range" + if (after != null) "\nДальше: ${after.optString("subject")}, ${at(after.getLong("start"))}" else "",
+                        ),
+                    )
+            } else {
+                builder.setSubText("Скоро пара").setContentText("Начало в ${at(start)}" + if (place.isNotEmpty()) " · $place" else "")
+                    .setWhen(start * 1000).setTimeoutAfter((start - now) * 1000)
+            }
             manager.notify(ID, builder.build())
+            // The bar moves once a minute.
+            if (live != null) scheduleTick(context, minOf(60L, end - now))
         } else {
             manager.cancel(ID)
         }
         if (next != Long.MAX_VALUE) {
-            val request = OneTimeWorkRequestBuilder<PairWorker>().setInitialDelay(maxOf(next - now, 1), TimeUnit.SECONDS).build()
+            // Wake once more shortly before a lesson starts, so the countdown for it can appear.
+            val wake = if (upcoming != null && live == null && upcoming.getLong("start") - now > SOON_SECONDS) upcoming.getLong("start") - SOON_SECONDS else next
+            val request = OneTimeWorkRequestBuilder<PairWorker>().setInitialDelay(maxOf(wake - now, 1), TimeUnit.SECONDS).build()
             WorkManager.getInstance(context).enqueueUniqueWork("pair-alert", ExistingWorkPolicy.REPLACE, request)
         }
+    }
+
+    private const val SOON_SECONDS = 25 * 60L
+
+    private fun scheduleTick(context: Context, seconds: Long) {
+        val alarms = context.getSystemService(android.app.AlarmManager::class.java)
+        val pending = PendingIntent.getBroadcast(context, 5, Intent(context, PairReceiver::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        alarms.setAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + maxOf(seconds, 1L) * 1000, pending)
+    }
+}
+
+/** The once-a-minute tick that moves the progress bar of the running lesson. */
+class PairReceiver : android.content.BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        PairAlert.refresh(context.applicationContext)
     }
 }
 

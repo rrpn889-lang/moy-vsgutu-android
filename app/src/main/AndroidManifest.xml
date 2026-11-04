@@ -30,6 +30,8 @@
             android:exported="true"
             android:windowSoftInputMode="adjustResize" />
 
+        <receiver android:name=".PairReceiver" android:exported="false" />
+
         <!-- One launcher entry per icon colour; the settings screen enables exactly one of them. -->
         <activity-alias
             android:name=".IconBlue"
