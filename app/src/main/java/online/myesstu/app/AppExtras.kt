@@ -126,14 +126,30 @@ object Updater {
     suspend fun download(context: Context, info: UpdateInfo): File = withContext(Dispatchers.IO) {
         val target = File(context.cacheDir, "exports/update.apk").apply { parentFile?.mkdirs() }
         val client = Api.client.newBuilder().readTimeout(90, TimeUnit.SECONDS).build()
-        try {
-            client.newCall(Request.Builder().url(info.url).get().build()).execute().use { response ->
-                if (!response.isSuccessful) throw ApiException("Не удалось скачать обновление (${response.code})", response.code)
-                val body = response.body ?: throw ApiException("Сервер прислал пустой файл")
-                body.byteStream().use { input -> target.outputStream().use { input.copyTo(it) } }
+        target.delete()
+        // Some networks cut a long download off halfway; each retry continues from where the file stopped,
+        // and the file is only handed to the installer when it is exactly as long as GitHub says.
+        var failure: Exception? = null
+        for (attempt in 1..6) {
+            try {
+                val have = if (target.exists()) target.length() else 0L
+                if (info.size > 0 && have == info.size) break
+                val request = Request.Builder().url(info.url).apply { if (have > 0) header("Range", "bytes=$have-") }.get().build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw ApiException("Не удалось скачать обновление (${response.code})", response.code)
+                    val append = have > 0 && response.code == 206
+                    val body = response.body ?: throw ApiException("Сервер прислал пустой файл")
+                    body.byteStream().use { input -> java.io.FileOutputStream(target, append).use { input.copyTo(it) } }
+                }
+                if (info.size <= 0 || target.length() == info.size) break
+            } catch (e: IOException) {
+                failure = e
             }
-        } catch (e: IOException) {
-            throw ApiException("Нет связи с сервером")
+            kotlinx.coroutines.delay(1_000)
+        }
+        if (info.size > 0 && target.length() != info.size) {
+            target.delete()
+            throw ApiException(if (failure != null) "Нет связи с GitHub. Проверь интернет и повтори." else "Файл скачался не полностью. Повтори ещё раз.")
         }
         target
     }

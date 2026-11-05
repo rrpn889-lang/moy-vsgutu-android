@@ -12,13 +12,22 @@ android {
         applicationId = "online.myesstu.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.2.8"
+        versionCode = 11
+        versionName = "0.2.9"
     }
+
 
     buildTypes {
         release {
+            // Friends install this build: not debuggable, and signed with the same key as the earlier builds so updates keep working.
             isMinifyEnabled = false
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug").apply {
+                // Old installers and phone vendors' package scanners read only the classic JAR signature, so all three schemes are written.
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+            }
         }
     }
 

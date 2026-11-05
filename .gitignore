@@ -10,3 +10,4 @@ render/
 *.jks
 .idea/
 release.sh
+build-out/
